@@ -65,31 +65,34 @@ HTML_HEAD = """<!DOCTYPE NETSCAPE-Bookmark-file-1>
 <TITLE>Bookmarks</TITLE>"""
 
 
-def to_html(bookmarks):
-    def add_node(folder):
-        html_node = ''
-        if folder['children']:
-            for child in folder['children']:
-                html_node += add_node(child)
+def bookmarks_to_html(bookmarks):
+    def add_node(node, spaces):
+        if 'uri' in node:
+            return f'{spaces * " "}<DT><A HREF="{node["uri"]}" ADD_DATE="{node["dateAdded"] >> 3}" LAST_MODIFIED="{node["lastModified"] >> 3}">{node["title"]}</A>\n'
+        else:
+            html_node = ''
+            if node['guid'] != ROOT[1]:
+                html_node += f'{spaces * " "}<DT><H3 ADD_DATE="{node["dateAdded"] >> 3}" LAST_MODIFIED="{node["lastModified"] >> 3}"'
+                if node['guid'] == ROOT[2]:
+                    html_node += ' PERSONAL_TOOLBAR_FOLDER="true"'
+                    node['title'] = 'Bookmarks Toolbar'
+                elif node['guid'] == ROOT[3]:
+                    html_node += ' UNFILED_BOOKMARKS_FOLDER="true"'
+                    node['title'] = 'Other Bookmarks'
+                html_node += f'>{node["title"]}</H3>\n'
+                html_node += spaces * ' ' + "<DL><p>\n"
+            if 'children' in node:
+                for child in node['children']:
+                    html_node += add_node(child, spaces+4)
+            if node['guid'] != ROOT[1]:
+                html_node += spaces * " " + "</DL><p>\n"
+            return html_node
 
-    bookmark_menu = [node for node in bookmarks['children'] if node['guid'] == ROOT[1]]
-    bookmark_toolbar = [node for node in bookmarks['children'] if node['guid'] == ROOT[2]]
-    bookmark_other = [node for node in bookmarks['children'] if node['guid'] == ROOT[3]]
-    rest = [node for node in bookmarks['children'] if node['guid'] != ROOT[1] and node['guid'] != ROOT[2] and node['guid'] != ROOT[3]]
-
-    html = f"""{HTML_HEAD}
+    return f"""{HTML_HEAD}
 <H1>Bookmarks Menu</H1>
 
 <DL><p>
-    {''.join([add_node(child) for child in bookmark_menu['children']])}
-    <DT><H3 ADD_DATE="{bookmark_toolbar['dateAdded'] >> 3}" LAST_MODIFIED="{bookmark_toolbar['lastModified'] >> 3}" PERSONAL_TOOLBAR_FOLDER="true">Bookmarks Toolbar</H3>
-    <DL><p>
-        {''.join([add_node(child) for child in bookmark_toolbar['children']])}
-    </DL><p>
-    <DT><H3 ADD_DATE="{bookmark_other['dateAdded'] >> 3}" LAST_MODIFIED="{bookmark_other['lastModified'] >> 3}" UNFILED_BOOKMARKS_FOLDER="true">Other Bookmarks</H3>
-    <DL><p>
-        {''.join([add_node(child) for child in bookmark_other['children']])}
-    </DL><p>
+{''.join([add_node(child, 4) for child in bookmarks['children']])}
 </DL>"""
 
 
@@ -132,9 +135,9 @@ def set_fileformat(filename, fformat):
 
 def main():
     ff_package_name = "org.mozilla.firefox"
-    fileformat = None
     infile = None
     outfile = None
+    fileformat = None
     dbfile = None
     privkey = os.path.join(os.path.expanduser('~'), '.android', 'adbkey')
     pubkey = f'{privkey}.pub'
@@ -156,7 +159,7 @@ def main():
                         required=False,
                         default=fileformat,
                         choices=VALID_FORMATS,
-                        help=f'Specify the output format. If omitted, the format is determined from the outfile extension and falls back to {DEFAULT_FORMAT}.')
+                        help=f'Specify the output format. If omitted, the format is determined from the outfile extension or "{DEFAULT_FORMAT}" as fallback.')
     parser.add_argument('-d',
                         '--db-file',
                         type=str,
@@ -164,21 +167,21 @@ def main():
                         dest='dbfile',
                         required=False,
                         default=dbfile,
-                        help=f'Use this sqlite db instead of fetching it from the device')
+                        help=f'Use DBFILE instead of fetching the places.sqlite db from the device')
     parser.add_argument('--public-key',
                         type=str,
                         action='store',
                         dest='pubkey',
                         required=False,
                         default=pubkey,
-                        help=f'The public key file to use. Defaults to {pubkey}.')
+                        help=f'The public key file to use. Defaults to "{pubkey}".')
     parser.add_argument('--private-key',
                         type=str,
                         action='store',
                         dest='privkey',
                         required=False,
                         default=privkey,
-                        help=f'The private key file to use. Defaults to {privkey}.')
+                        help=f'The private key file to use. Defaults to "{privkey}".')
     command_group = parser.add_mutually_exclusive_group(required=True)
     command_group.add_argument('-i',
                                '--import',
@@ -199,9 +202,9 @@ def main():
 
     args = parser.parse_args()
     ff_package_name = args.ff_package_name
-    fileformat = set_fileformat(infile or outfile or '', args.fformat)
     infile = args.infile
     outfile = args.outfile
+    fileformat = set_fileformat(infile or outfile or '', args.fformat)
     dbfile = args.dbfile
     pubkey = args.pubkey
     privkey = args.privkey
@@ -240,10 +243,10 @@ def main():
 
                 bookmarks_out = ''
                 if fileformat == Format.JSON:
-                    bookmark_out = json.dumps(bookmarks)
+                    bookmarks_out = json.dumps(bookmarks)
                 elif fileformat == Format.HTML:
                     # Convert to HTML
-                    bookmarks_out = 'HTML'
+                    bookmarks_out = bookmarks_to_html(bookmarks)
                 else:
                     raise RuntimeError('No valid format given.')
 
@@ -261,7 +264,6 @@ def main():
             # This should not happen
             else:
                 raise RuntimeError('No export or import flag given.')
-
 
 
 if __name__ == '__main__':

@@ -17,9 +17,9 @@ import sqlite3
 import string
 import sys
 import tempfile
+import usb1
 import xml.etree.ElementTree as ET
 
-import usb1
 from adb_shell.adb_device import AdbDeviceTcp, AdbDeviceUsb
 from adb_shell.auth.sign_pythonrsa import PythonRSASigner
 from adb_shell.auth.keygen import keygen, write_public_keyfile
@@ -41,7 +41,8 @@ WAL_EXTENSION = '-wal'
 ANDROID_TEMP_DIR = '/data/local/tmp'
 DB_TEMP_FILE = f'{ANDROID_TEMP_DIR}/{DB_FILE_NAME}'
 
-ADB_DEFAULT_PORT = 5555
+ADB_DEVICE_DEFAULT_PORT = 5555
+ADB_SERVER_DEFAULT_PORT = 5037
 
 END_TAG_NAME = string.whitespace + '>'
 
@@ -523,7 +524,7 @@ def main():
                         dest='adb_tcp',
                         required=False,
                         default=adb_tcp,
-                        help=f'The address and port of the device in the format "host:port". Port defaults to {ADB_DEFAULT_PORT} if omitted.')
+                        help=f'The address and port of the device in the format "host:port". Port defaults to {ADB_DEVICE_DEFAULT_PORT} if omitted.')
     parser.add_argument('--private-key',
                         type=str,
                         action='store',
@@ -601,14 +602,22 @@ def main():
     dbfile = args.dbfile
     adb_tcp = args.adb_tcp
     if adb_tcp is not None:
+        # If adb_tcp is given, we assume the user wants to connect directly via ADB over network
+        # Note that this can be overridden with --server
         force_server = False
+        # Set default port if not specified
         if ':' not in adb_tcp:
-            adb_tcp = f'{adb_tcp}:{ADB_DEFAULT_PORT}'
+            adb_tcp = f'{adb_tcp}:{ADB_DEVICE_DEFAULT_PORT}'
     pubkey = args.pubkey
     privkey = args.privkey
     if adb_server != args.adb_server:
+        # If adb_server is given, we assume the user wants to connect via an ADB server
+        # Note that this can be overridden with --no-server
         force_server = True
         adb_server = args.adb_server
+        # Set default port if not specified
+        if ':' not in adb_server:
+            adb_tcp = f'{adb_tcp}:{ADB_SERVER_DEFAULT_PORT}'
     adb_serial = args.adb_serial
     if args.force_server is not None:
         force_server = args.force_server

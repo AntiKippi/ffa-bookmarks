@@ -1,1 +1,2 @@
 adb_shell[usb]
+pure-python-adb

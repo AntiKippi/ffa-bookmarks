@@ -5,20 +5,25 @@
 # Utility to manage bookmarks in Firefox for Android
 #
 # Author: Kippi
-# Version: 0.0.0
+# Version: 0.0.2
 ######################################################
 
 import argparse
 import json
 import os
 import random
+import shutil
 import sqlite3
 import string
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+
+import usb1
 from adb_shell.adb_device import AdbDeviceTcp, AdbDeviceUsb
 from adb_shell.auth.sign_pythonrsa import PythonRSASigner
+from adb_shell.auth.keygen import keygen, write_public_keyfile
+from ppadb.client import Client as AdbClient
 from contextlib import closing
 from enum import Enum, StrEnum, auto
 
@@ -27,6 +32,7 @@ class Format(StrEnum):
     HTML = auto(),
     JSON = auto()
 
+
 VALID_FORMATS = [f.value for f in Format]
 DEFAULT_FORMAT = None
 
@@ -34,6 +40,8 @@ DB_FILE_NAME = 'places.sqlite'
 WAL_EXTENSION = '-wal'
 ANDROID_TEMP_DIR = '/data/local/tmp'
 DB_TEMP_FILE = f'{ANDROID_TEMP_DIR}/{DB_FILE_NAME}'
+
+ADB_DEFAULT_PORT = 5555
 
 END_TAG_NAME = string.whitespace + '>'
 
@@ -44,11 +52,11 @@ CHILDREN_QUERY = f'{BASE_QUERY} WHERE mb.parent = ?'
 URL_EXISTS_QUERY = 'SELECT id FROM moz_places WHERE url = ?'
 LAST_INSERTED_QUERY = 'SELECT last_insert_rowid()'
 INSERT_PLACE_QUERY = 'INSERT INTO moz_places(url, guid, url_hash) VALUES (:url, :guid, 0)'
-INSERT_BOOKMARK_QUERY = 'INSERT INTO moz_bookmarks (id, fk, type, parent, position, title, dateAdded, lastModified, guid) ' +\
-                         'VALUES (:id, :fk, :typeCode, :parent, :index, :title, :dateAdded, :lastModified, :guid) ' +\
-                         'ON CONFLICT DO UPDATE SET fk = :fk, type = :typeCode, parent = :parent, position = :index, title = :title, dateAdded = :dateAdded, lastModified = :lastModified, guid = :guid'
+INSERT_BOOKMARK_QUERY = 'INSERT INTO moz_bookmarks (id, fk, type, parent, position, title, dateAdded, lastModified, guid) ' + \
+                        'VALUES (:id, :fk, :typeCode, :parent, :index, :title, :dateAdded, :lastModified, :guid) ' + \
+                        'ON CONFLICT DO UPDATE SET fk = :fk, type = :typeCode, parent = :parent, position = :index, title = :title, dateAdded = :dateAdded, lastModified = :lastModified, guid = :guid'
 INSERT_BOOKMARK_AUTOINCREMENT_QUERY = 'INSERT INTO moz_bookmarks (fk, type, parent, position, title, dateAdded, lastModified, guid) ' + \
-                         'VALUES (:fk, :typeCode, :parent, :index, :title, :dateAdded, :lastModified, :guid)'
+                                      'VALUES (:fk, :typeCode, :parent, :index, :title, :dateAdded, :lastModified, :guid)'
 
 TYPE_LOOKUP = {
     1: 'text/x-moz-place',
@@ -78,12 +86,12 @@ def bookmarks_to_html(bookmarks):
         node['dateAdded'] = int(node['dateAdded'] / 1000)
         node['lastModified'] = int(node['lastModified'] / 1000)
         # Sanitize
-        node['title'] = node['title']\
-            .replace('<', '&lt;')\
+        node['title'] = node['title'] \
+            .replace('<', '&lt;') \
             .replace('>', '&gt;') \
-            .replace('"', '&quot;')\
-            .replace("'", '&#39;')\
-            .replace('&', '&amp;')\
+            .replace('"', '&quot;') \
+            .replace("'", '&#39;') \
+            .replace('&', '&amp;') \
             .replace('"', '&quot;')
         if 'uri' in node:
             return f'{spaces * " "}<DT><A HREF="{node["uri"]}" ADD_DATE="{node["dateAdded"]}" LAST_MODIFIED="{node["lastModified"]}">{node["title"]}</A>\n'
@@ -105,7 +113,7 @@ def bookmarks_to_html(bookmarks):
                 html_node += spaces * ' ' + "<DL><p>\n"
             if 'children' in node:
                 for child in node['children']:
-                    html_node += add_node(child, spaces+4)
+                    html_node += add_node(child, spaces + 4)
             if node['guid'] != ROOT[1]:
                 html_node += spaces * " " + "</DL><p>\n"
             return html_node
@@ -185,18 +193,18 @@ def html_to_xmltree(html):
 
     for i in range(0, len(html)):
         if state == State.InsideQuoteString:
-            if html[i] == quote and html[i-1] != '\\':
+            if html[i] == quote and html[i - 1] != '\\':
                 state = new_state.pop()
                 quote = None
             # Escape all <, > and & in strings
             elif html[i] == '>':
                 html[i] = '&'
-                html.insert(i+1, 'gt;')
+                html.insert(i + 1, 'gt;')
             elif html[i] == '<':
                 html[i] = '&'
-                html.insert(i+1, 'lt;')
+                html.insert(i + 1, 'lt;')
             elif html[i] == '&':
-                html.insert(i+1, 'amp;')
+                html.insert(i + 1, 'amp;')
         elif state == State.KillTag:
             if html[i] == '>':
                 state = new_state.pop()
@@ -209,7 +217,8 @@ def html_to_xmltree(html):
         # Skip all the junk at the beginning until the first <DL>
         elif state == State.Initial:
             if html[i] == '<':
-                if i < len(html) + 3 and html[i+1].upper() == 'D' and html[i+2].upper() == 'L' and html[i+3] in END_TAG_NAME:
+                if i < len(html) + 3 and html[i + 1].upper() == 'D' and html[i + 2].upper() == 'L' and html[
+                    i + 3] in END_TAG_NAME:
                     # i should now be at the beginning of the outer <DL> block
                     start = i
                     new_state.append(state.Found)
@@ -223,8 +232,9 @@ def html_to_xmltree(html):
         elif state == State.Found:
             if html[i] == '<':
                 new_state.append(state)
-                if (i < len(html) + 2 and html[i+1].upper() == 'P' and html[i+2] in END_TAG_NAME) or \
-                        (i < len(html) + 3 and html[i+1].upper() == 'D' and html[i+2].upper() == 'T' and html[i+3] in END_TAG_NAME):
+                if (i < len(html) + 2 and html[i + 1].upper() == 'P' and html[i + 2] in END_TAG_NAME) or \
+                        (i < len(html) + 3 and html[i + 1].upper() == 'D' and html[i + 2].upper() == 'T' and html[
+                            i + 3] in END_TAG_NAME):
                     html[i] = ' '
                     state = State.KillTag
                 else:
@@ -318,7 +328,8 @@ def export_node(conn, node):
             children = res.fetchall()
             children_nodes = [export_node(conn, n) for n in children]
 
-    return generate_node(node[0], node[1], node[2], node[3] * 1000, node[4] * 1000, node[5], node[6], node[7], children_nodes)
+    return generate_node(node[0], node[1], node[2], node[3] * 1000, node[4] * 1000, node[5], node[6], node[7],
+                         children_nodes)
 
 
 def guess_fileformat(file):
@@ -328,7 +339,8 @@ def guess_fileformat(file):
     while file[i] not in JSON_INDICATORS + HTML_INDICATORS and i < len(file):
         i += 1
 
-    return Format.HTML if file[i] in HTML_INDICATORS else (Format.JSON if file[i] in JSON_INDICATORS else DEFAULT_FORMAT)
+    return Format.HTML if file[i] in HTML_INDICATORS else (
+        Format.JSON if file[i] in JSON_INDICATORS else DEFAULT_FORMAT)
 
 
 def set_fileformat(filename, fformat):
@@ -339,32 +351,144 @@ def set_fileformat(filename, fformat):
         return Format(ext) if ext in VALID_FORMATS else DEFAULT_FORMAT
 
 
-def main():
-    adb_device = None
-    def get_adb_device():
-        nonlocal privkey, pubkey, adb_device
+_tmpdir = None
+def get_tmpdir():
+    global _tmpdir
 
-        if adb_device is None:
-            # Load the public and private keys
+    if _tmpdir is None:
+        _tmpdir = tempfile.TemporaryDirectory()
+
+    return _tmpdir
+
+
+def initialize_adb_device(adb_tcp, privkey, pubkey, adb_server, adb_serial, force_server):
+    dev = None
+
+    def initialize_direct():
+        nonlocal dev, adb_tcp, privkey, pubkey
+
+        # Try loading the private key
+        try:
             with open(privkey) as f:
                 priv = f.read()
+        except FileNotFoundError:
+            # If private key file doesn't exist, create it
+            tmpdir = get_tmpdir()
+            keypath = os.path.join(tmpdir.name, 'adbkey')
+            keypath_pub = f'{keypath}.pub'
+
+            # Create a public/private keypair at keypath and keypath.pub
+            keygen(keypath)
+
+            # Create any parent directories if necessary
+            os.makedirs(os.path.dirname(privkey), exist_ok=True)
+
+            # Move newly generated private key to privkey
+            shutil.move(keypath, privkey)
+
+            # Also create the public key if it does not exist
+            # Note that this creates a TOCTOU race-condition
+            # Should be fine in almost all cases though
+            if os.path.isfile(pubkey):
+                print(f'WARNING: Public key file "{pubkey}" already exists and will not be overwritten')
+                pubkey = keypath_pub
+            else:
+                shutil.move(keypath_pub, pubkey)
+
+            # Retry after key has been generated
+            with open(privkey) as f:
+                priv = f.read()
+
+        # Try reading the public key file
+        try:
             with open(pubkey) as f:
                 pub = f.read()
-            signer = PythonRSASigner(pub, priv)
+        # Just generate a public key if it does not exist
+        except FileNotFoundError:
+            # Create any parent directories if necessary
+            os.makedirs(os.path.dirname(pubkey), exist_ok=True)
 
-            # Connect via USB
-            adb_device = AdbDeviceUsb()
-            adb_device.connect(rsa_keys=[signer])
-        return adb_device
+            # Create public keyfile
+            write_public_keyfile(privkey, pubkey)
+
+            # Retry after file has been generated
+            with open(pubkey) as f:
+                pub = f.read()
+
+        signer = PythonRSASigner(pub, priv)
+
+        if adb_tcp is None:
+            dev = AdbDeviceUsb()
+        else:
+            host, port = adb_tcp.split(':')
+            dev = AdbDeviceTcp(host=host, port=int(port))
+
+        dev.connect(rsa_keys=[signer])
+
+    def initialize_server():
+        nonlocal dev, adb_server, adb_serial
+
+        host, port = adb_server.split(':')
+        client = AdbClient(host=host, port=int(port))
+        devices = client.devices()
+
+        if len(devices) < 1:
+            raise RuntimeError('No ADB devices available')
+        elif len(devices) == 1:
+            dev = devices[0]
+        elif adb_serial is not None:
+            dev = client.device(adb_serial)
+        else:
+            raise RuntimeError(f'No device selected. Available devices:\n{os.linesep.join([dev.serial for dev in devices])}')
+
+    if force_server is None:
+        # Try with adb_shell (native adb)
+        try:
+            initialize_direct()
+        # Fall back to pure_python_adb if it doesn't work (needs running adb server)
+        except Exception:
+            initialize_server()
+    elif force_server:
+        initialize_server()
+    else:
+        initialize_direct()
+
+    if dev is None:
+        raise RuntimeError('Could not initialize ADB device')
+
+    return dev
+
+
+def main():
+    _adb_device = None
+    def get_adb_device():
+        nonlocal _adb_device, adb_tcp, privkey, pubkey, adb_server, adb_serial, force_server
+
+        if _adb_device is None:
+            try:
+                _adb_device = initialize_adb_device(adb_tcp, privkey, pubkey, adb_server, adb_serial, force_server)
+            except usb1.USBError as e:
+                print(f'ERROR [ADB]: {e}. Do you have an adb server running?')
+                exit(1)
+            except Exception as e:
+                print(f'ERROR [ADB]: {e}')
+                exit(1)
+
+        return _adb_device
 
     ff_package_name = "org.mozilla.firefox"
-    infile = None
-    outfile = None
     fileformat = None
-    copydb = False
     dbfile = None
+    adb_tcp = None
     privkey = os.path.join(os.path.expanduser('~'), '.android', 'adbkey')
     pubkey = f'{privkey}.pub'
+    adb_server = '127.0.0.1:5037'
+    adb_serial = None
+    force_server = None
+
+    infile = None
+    outfile = None
+    copydb = False
 
     parser = argparse.ArgumentParser(description='Manage your bookmarks in Firefox for Android')
     parser.add_argument('-p',
@@ -391,21 +515,57 @@ def main():
                         dest='dbfile',
                         required=('-c' in sys.argv or '--copy' in sys.argv),
                         default=dbfile,
-                        help=f'Use DBFILE instead of fetching the places.sqlite db from the device')
-    parser.add_argument('--public-key',
+                        help='Use DBFILE instead of fetching the places.sqlite db from the device.')
+    parser.add_argument('-a',
+                        '--adb-device-tcp',
                         type=str,
                         action='store',
-                        dest='pubkey',
+                        dest='adb_tcp',
                         required=False,
-                        default=pubkey,
-                        help=f'The public key file to use. Defaults to "{pubkey}".')
+                        default=adb_tcp,
+                        help=f'The address and port of the device in the format "host:port". Port defaults to {ADB_DEFAULT_PORT} if omitted.')
     parser.add_argument('--private-key',
                         type=str,
                         action='store',
                         dest='privkey',
                         required=False,
                         default=privkey,
-                        help=f'The private key file to use. Defaults to "{privkey}".')
+                        help=f'The private key file to use. Defaults to "{privkey}". '
+                             f'The file will be created if it does not exist.')
+    parser.add_argument('--public-key',
+                        type=str,
+                        action='store',
+                        dest='pubkey',
+                        required=False,
+                        default=pubkey,
+                        help=f'The public key file to use. Defaults to "{pubkey}". '
+                             f'The file will be created if it does not exist.')
+    parser.add_argument('--adb_server',
+                        type=str,
+                        action='store',
+                        dest='adb_server',
+                        required=False,
+                        default=adb_server,
+                        help=f'The ADB server to use. Defaults to "{adb_server}".`')
+    parser.add_argument('-s',
+                        '--serial',
+                        type=str,
+                        action='store',
+                        dest='adb_serial',
+                        required=False,
+                        default=adb_serial,
+                        help='The serial number of the device to use as shown in `adb devices`.')
+    server_group = parser.add_mutually_exclusive_group(required=False)
+    server_group.add_argument('--server',
+                              action='store_true',
+                              dest='force_server',
+                              required=False,
+                              help='Force the usage of the ADB server.')
+    server_group.add_argument('--no-server',
+                              action='store_false',
+                              dest='force_server',
+                              required=False,
+                              help='Force a direct device connection via USB or TCP.')
     command_group = parser.add_mutually_exclusive_group(required=True)
     command_group.add_argument('-i',
                                '--import',
@@ -415,7 +575,7 @@ def main():
                                const='',
                                dest='infile',
                                default=infile,
-                               help='Import the booksmarks from INFILE. If INFILE is omitted stdin is used')
+                               help='Import the booksmarks from INFILE. If INFILE is omitted stdin is used.')
     command_group.add_argument('-e',
                                '--export',
                                type=str,
@@ -433,14 +593,25 @@ def main():
                                help=f'Copy the {DB_FILE_NAME} file to the DBFILE specified by -d.')
 
     args = parser.parse_args()
-    ff_package_name = args.ff_package_name.replace("'", "'\\''\\\\'\\'''\\''")  # Prevent command injection
     infile = args.infile
     outfile = args.outfile
-    fileformat = set_fileformat(infile or outfile or '', args.fformat)
     copydb = args.copydb
+    ff_package_name = args.ff_package_name.replace("'", "'\\''\\\\'\\'''\\''")  # Prevent command injection
+    fileformat = set_fileformat(infile or outfile or '', args.fformat)
     dbfile = args.dbfile
+    adb_tcp = args.adb_tcp
+    if adb_tcp is not None:
+        force_server = False
+        if ':' not in adb_tcp:
+            adb_tcp = f'{adb_tcp}:{ADB_DEFAULT_PORT}'
     pubkey = args.pubkey
     privkey = args.privkey
+    if adb_server != args.adb_server:
+        force_server = True
+        adb_server = args.adb_server
+    adb_serial = args.adb_serial
+    if args.force_server is not None:
+        force_server = args.force_server
 
     if copydb or dbfile is None:
         device = get_adb_device()
@@ -452,7 +623,7 @@ def main():
         device.shell(f'su -c \'{get_db_commands}\'')
 
         if dbfile is None:
-            tmpdir = tempfile.TemporaryDirectory()
+            tmpdir = get_tmpdir()
             dbfile = os.path.join(tmpdir.name, DB_FILE_NAME)
 
         # Copy db to host

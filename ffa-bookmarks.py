@@ -5,7 +5,7 @@
 # Utility to manage bookmarks in Firefox for Android
 #
 # Author: Kippi
-# Version: 0.0.2
+# Version: 0.0.3
 ######################################################
 
 import argparse
@@ -21,11 +21,12 @@ import usb1
 import xml.etree.ElementTree as ET
 
 from adb_shell.adb_device import AdbDeviceTcp, AdbDeviceUsb
-from adb_shell.auth.sign_pythonrsa import PythonRSASigner
 from adb_shell.auth.keygen import keygen, write_public_keyfile
-from ppadb.client import Client as AdbClient
+from adb_shell.auth.sign_pythonrsa import PythonRSASigner
 from contextlib import closing
 from enum import Enum, StrEnum, auto
+from ppadb.client import Client as AdbClient
+from ppadb.device import Device as PPAdbDevice
 
 
 class Format(StrEnum):
@@ -80,7 +81,6 @@ ROOT_LOOKUP = {
     ROOT[3]: 'unfiledBookmarksFolder',
     ROOT[4]: 'mobileFolder'
 }
-
 
 def bookmarks_to_html(bookmarks):
     def add_node(node, spaces):
@@ -368,53 +368,57 @@ def initialize_adb_device(adb_tcp, privkey, pubkey, adb_server, adb_serial, forc
     def initialize_direct():
         nonlocal dev, adb_tcp, privkey, pubkey
 
-        # Try loading the private key
-        try:
-            with open(privkey) as f:
-                priv = f.read()
-        except FileNotFoundError:
-            # If private key file doesn't exist, create it
-            tmpdir = get_tmpdir()
-            keypath = os.path.join(tmpdir.name, 'adbkey')
-            keypath_pub = f'{keypath}.pub'
+        # Try loading the private key, try once again if it failed
+        for i in range(0, 2):
+            try:
+                with open(privkey) as f:
+                    priv = f.read()
+            except FileNotFoundError:
+                # If private key file doesn't exist, create it
+                tmpdir = get_tmpdir()
+                keypath = os.path.join(tmpdir.name, 'adbkey')
+                keypath_pub = f'{keypath}.pub'
 
-            # Create a public/private keypair at keypath and keypath.pub
-            keygen(keypath)
+                # Create a public/private keypair at keypath and keypath.pub
+                keygen(keypath)
 
-            # Create any parent directories if necessary
-            os.makedirs(os.path.dirname(privkey), exist_ok=True)
+                # Create any parent directories if necessary
+                os.makedirs(os.path.dirname(privkey), exist_ok=True)
 
-            # Move newly generated private key to privkey
-            shutil.move(keypath, privkey)
+                # Move newly generated private key to privkey
+                shutil.move(keypath, privkey)
 
-            # Also create the public key if it does not exist
-            # Note that this creates a TOCTOU race-condition
-            # Should be fine in almost all cases though
-            if os.path.isfile(pubkey):
-                print(f'WARNING: Public key file "{pubkey}" already exists and will not be overwritten')
-                pubkey = keypath_pub
-            else:
-                shutil.move(keypath_pub, pubkey)
+                # Also create the public key if it does not exist
+                # Note that this creates a TOCTOU race-condition
+                # Should be fine in basically all cases though
+                if os.path.isfile(pubkey):
+                    sys.stderr.write(f'WARNING: Public key file "{pubkey}" already exists and will not be overwritten')
+                    pubkey = keypath_pub
+                else:
+                    shutil.move(keypath_pub, pubkey)
 
-            # Retry after key has been generated
-            with open(privkey) as f:
-                priv = f.read()
+                # Retry after key has been generated
+                continue
+            # Stop the loop if it was successful
+            break
 
-        # Try reading the public key file
-        try:
-            with open(pubkey) as f:
-                pub = f.read()
-        # Just generate a public key if it does not exist
-        except FileNotFoundError:
-            # Create any parent directories if necessary
-            os.makedirs(os.path.dirname(pubkey), exist_ok=True)
+        # Try reading the public key file, try once again if it fails
+        for i in range(0, 2):
+            try:
+                with open(pubkey) as f:
+                    pub = f.read()
+            # Just generate a public key if it does not exist
+            except FileNotFoundError:
+                # Create any parent directories if necessary
+                os.makedirs(os.path.dirname(pubkey), exist_ok=True)
 
-            # Create public keyfile
-            write_public_keyfile(privkey, pubkey)
+                # Create public keyfile
+                write_public_keyfile(privkey, pubkey)
 
-            # Retry after file has been generated
-            with open(pubkey) as f:
-                pub = f.read()
+                # Retry after file has been generated
+                continue
+            # Stop the loop if it was successful
+            break
 
         signer = PythonRSASigner(pub, priv)
 
@@ -442,20 +446,26 @@ def initialize_adb_device(adb_tcp, privkey, pubkey, adb_server, adb_serial, forc
         else:
             raise RuntimeError(f'No device selected. Available devices:\n{os.linesep.join([dev.serial for dev in devices])}')
 
+    errors = []
     if force_server is None:
         # Try with adb_shell (native adb)
         try:
             initialize_direct()
         # Fall back to pure_python_adb if it doesn't work (needs running adb server)
-        except Exception:
-            initialize_server()
+        except Exception as device_error:
+            # Collect the error to show it if the initialization via server also does not work
+            errors.append(device_error)
+            try:
+                initialize_server()
+            except Exception as server_error:
+                errors.append(server_error)
     elif force_server:
         initialize_server()
     else:
         initialize_direct()
 
     if dev is None:
-        raise RuntimeError('Could not initialize ADB device')
+        raise RuntimeError(f'Could not initialize ADB device. Errors: {errors}')
 
     return dev
 
@@ -469,10 +479,10 @@ def main():
             try:
                 _adb_device = initialize_adb_device(adb_tcp, privkey, pubkey, adb_server, adb_serial, force_server)
             except usb1.USBError as e:
-                print(f'ERROR [ADB]: {e}. Do you have an adb server running?')
+                sys.stderr.write(f'ERROR [ADB]: {e}.\nDevice might be blocked by your local adb server, try killing it.')
                 exit(1)
             except Exception as e:
-                print(f'ERROR [ADB]: {e}')
+                sys.stderr.write(f'ERROR [ADB]: {e}')
                 exit(1)
 
         return _adb_device
@@ -485,6 +495,7 @@ def main():
     pubkey = f'{privkey}.pub'
     adb_server = '127.0.0.1:5037'
     adb_serial = None
+    force = False
     force_server = None
 
     infile = None
@@ -500,15 +511,15 @@ def main():
                         required=False,
                         default=ff_package_name,
                         help=f'Specify the Firefox package name. Defaults to "{ff_package_name}".')
-    parser.add_argument('-f',
-                        '--format',
+    parser.add_argument('-t',
+                        '--file-type',
                         type=str.lower,
                         action='store',
                         dest='fformat',
                         required=False,
                         default=fileformat,
                         choices=VALID_FORMATS,
-                        help='Specify the output format. If omitted, the format is determined from the outfile extension or infile contents or JSON as fallback.')
+                        help='Specify the file format. If omitted, the format is determined from the outfile extension or infile contents or JSON as fallback.')
     parser.add_argument('-d',
                         '--db-file',
                         type=str,
@@ -556,6 +567,13 @@ def main():
                         required=False,
                         default=adb_serial,
                         help='The serial number of the device to use as shown in `adb devices`.')
+    parser.add_argument('-f',
+                        '--force',
+                        action='store_true',
+                        dest='force',
+                        required=False,
+                        default=force,
+                        help='Do not ask before overwriting files.')
     server_group = parser.add_mutually_exclusive_group(required=False)
     server_group.add_argument('--server',
                               action='store_true',
@@ -602,9 +620,6 @@ def main():
     dbfile = args.dbfile
     adb_tcp = args.adb_tcp
     if adb_tcp is not None:
-        # If adb_tcp is given, we assume the user wants to connect directly via ADB over network
-        # Note that this can be overridden with --server
-        force_server = False
         # Set default port if not specified
         if ':' not in adb_tcp:
             adb_tcp = f'{adb_tcp}:{ADB_DEVICE_DEFAULT_PORT}'
@@ -635,9 +650,28 @@ def main():
             tmpdir = get_tmpdir()
             dbfile = os.path.join(tmpdir.name, DB_FILE_NAME)
 
+        wal_file = f'{dbfile}{WAL_EXTENSION}'
+
+        # Ask before overwriting dbfile and dbfile-wal (if force flag is not set)
+        # Note that this creates a TOCTOU race-condition
+        # Should be fine in basically all cases though
+        if not force:
+            if os.path.isfile(dbfile):
+                # Use stderr for input to avoid cluttering stdout
+                sys.stderr.write(f'File "{dbfile}" already exists, overwrite? [y/N]: ')
+                resp = input().upper()
+                if resp not in ['Y', 'YES']:
+                    exit(1)
+            if os.path.isfile(wal_file):
+                # Use stderr for input to avoid cluttering stdout
+                sys.stderr.write(f'File "{wal_file}" already exists, overwrite? [y/N]: ')
+                resp = input().upper()
+                if resp not in ['Y', 'YES']:
+                    exit(1)
+
         # Copy db to host
         device.pull(DB_TEMP_FILE, dbfile)
-        device.pull(f'{DB_TEMP_FILE}{WAL_EXTENSION}', f'{dbfile}{WAL_EXTENSION}')
+        device.pull(f'{DB_TEMP_FILE}{WAL_EXTENSION}', wal_file)
 
         # Cleanup
         device.shell(f'rm -f \'{DB_TEMP_FILE}\'')
@@ -664,11 +698,40 @@ def main():
             if outfile == '':
                 print(bookmarks_out, end='')
             else:
+                # Ask before overwriting (if force flag is not set)
+                # Note that this creates a TOCTOU race-condition
+                # Should be fine in basically all cases though
+                if os.path.isfile(outfile) and not force:
+                    # Use stderr for input to avoid cluttering stdout
+                    # Not really needed here since write to file is guaranteed, but still stderr is used for consistency
+                    sys.stderr.write(f'File "{outfile}" already exists, overwrite? [y/N]: ')
+                    resp = input().upper()
+                    if resp not in ['Y', 'YES']:
+                        exit(1)
+
                 with open(outfile, 'w') as ofile:
                     ofile.write(bookmarks_out)
 
     # The import flag has been used
     elif infile is not None:
+        device = get_adb_device()
+
+        if not force:
+            server_connection = isinstance(device, PPAdbDevice)
+            dev_str = device.get_serial_no() if server_connection else (adb_tcp if adb_tcp is not None else "USB")
+            # Use stderr for input to avoid cluttering stdout
+            # Not really needed here since we are importing, but still stderr is used for consistency
+            sys.stderr.write('Please review before importing:\n'
+                  f' - ADB Connection: {f"Server at {adb_server}" if server_connection else "Direct"}\n'
+                  f' - ADB Device: {dev_str}\n'
+                  f' - Firefox package name: {ff_package_name}\n'
+                  f' - Import file: "{infile if infile is not None else "stdin"}"\n'
+                  'Your existing bookmarks might be overridden. Continue? [y/N]: ')
+
+            resp = input().upper()
+            if resp not in ['Y', 'YES']:
+                exit(1)
+
         with sqlite3.connect(dbfile) as conn:
             if infile == '':
                 file_contents = sys.stdin.read()
@@ -693,8 +756,6 @@ def main():
             # Copy the WAL content into the main db
             tmpres = conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
             tmpres.close()
-
-        device = get_adb_device()
 
         # Copy db to device
         device.push(dbfile, DB_TEMP_FILE)

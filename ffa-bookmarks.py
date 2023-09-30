@@ -5,7 +5,7 @@
 # Utility to manage bookmarks in Firefox for Android
 #
 # Author: Kippi
-# Version: 0.0.3
+# Version: 0.0.4
 ######################################################
 
 import argparse
@@ -46,6 +46,8 @@ ADB_DEVICE_DEFAULT_PORT = 5555
 ADB_SERVER_DEFAULT_PORT = 5037
 
 END_TAG_NAME = string.whitespace + '>'
+
+STDSTREAM_INDICATOR = ''
 
 BASE_QUERY = 'SELECT mb.guid, mb.title, mb.position, mb.dateAdded, mb.lastModified, mb.id, mb.type, mp.url FROM moz_bookmarks mb LEFT OUTER JOIN moz_places mp ON mb.fk = mp.id'
 NODE_QUERY = f'{BASE_QUERY} WHERE mb.guid = ?'
@@ -500,7 +502,7 @@ def main():
 
     infile = None
     outfile = None
-    copydb = False
+    copy_db_target = None
 
     parser = argparse.ArgumentParser(description='Manage your bookmarks in Firefox for Android')
     parser.add_argument('-p',
@@ -525,7 +527,7 @@ def main():
                         type=str,
                         action='store',
                         dest='dbfile',
-                        required=('-c' in sys.argv or '--copy' in sys.argv),
+                        required=False,
                         default=dbfile,
                         help='Use DBFILE instead of fetching the places.sqlite db from the device.')
     parser.add_argument('-a',
@@ -535,7 +537,8 @@ def main():
                         dest='adb_tcp',
                         required=False,
                         default=adb_tcp,
-                        help=f'The address and port of the device in the format "host:port". Port defaults to {ADB_DEVICE_DEFAULT_PORT} if omitted.')
+                        help='The address and port of the device in the format "host:port". '
+                             f'Port defaults to {ADB_DEVICE_DEFAULT_PORT} if omitted.')
     parser.add_argument('--private-key',
                         type=str,
                         action='store',
@@ -543,7 +546,7 @@ def main():
                         required=False,
                         default=privkey,
                         help=f'The private key file to use. Defaults to "{privkey}". '
-                             f'The file will be created if it does not exist.')
+                             'The file will be created if it does not exist.')
     parser.add_argument('--public-key',
                         type=str,
                         action='store',
@@ -551,7 +554,7 @@ def main():
                         required=False,
                         default=pubkey,
                         help=f'The public key file to use. Defaults to "{pubkey}". '
-                             f'The file will be created if it does not exist.')
+                             'The file will be created if it does not exist.')
     parser.add_argument('--adb_server',
                         type=str,
                         action='store',
@@ -591,7 +594,7 @@ def main():
                                type=str,
                                action='store',
                                nargs='?',
-                               const='',
+                               const=STDSTREAM_INDICATOR,
                                dest='infile',
                                default=infile,
                                help='Import the booksmarks from INFILE. If INFILE is omitted stdin is used.')
@@ -600,21 +603,23 @@ def main():
                                type=str,
                                action='store',
                                nargs='?',
-                               const='',
+                               const=STDSTREAM_INDICATOR,
                                dest='outfile',
                                default=outfile,
-                               help='Export the bookmarks to OUTFILE. If OUTFILE is omitted the results are written to stdout.')
+                               help='Export the bookmarks to OUTFILE. '
+                                    'If OUTFILE is omitted the results are written to stdout.')
     command_group.add_argument('-c',
                                '--copy-db',
-                               action='store_true',
-                               dest='copydb',
-                               default=copydb,
-                               help=f'Copy the {DB_FILE_NAME} file to the DBFILE specified by -d.')
+                               type=str,
+                               action='store',
+                               dest='target',
+                               default=copy_db_target,
+                               help='Copy the {DB_FILE_NAME} file to TARGET.')
 
     args = parser.parse_args()
     infile = args.infile
     outfile = args.outfile
-    copydb = args.copydb
+    copy_db_target = args.target
     ff_package_name = args.ff_package_name.replace("'", "'\\''\\\\'\\'''\\''")  # Prevent command injection
     fileformat = set_fileformat(infile or outfile or '', args.fformat)
     dbfile = args.dbfile
@@ -637,7 +642,10 @@ def main():
     if args.force_server is not None:
         force_server = args.force_server
 
-    if copydb or dbfile is None:
+    if dbfile is None:
+        tmpdir = get_tmpdir()
+        dbfile = os.path.join(tmpdir.name, DB_FILE_NAME)
+
         device = get_adb_device()
 
         # Copy db into tmp
@@ -646,30 +654,10 @@ def main():
                           f'chown shell:shell \'\\\'\'{DB_TEMP_FILE}\'\\\'\' \'\\\'\'{DB_TEMP_FILE}{WAL_EXTENSION}\'\\\'\';'
         device.shell(f'su -c \'{get_db_commands}\'')
 
-        if dbfile is None:
-            tmpdir = get_tmpdir()
-            dbfile = os.path.join(tmpdir.name, DB_FILE_NAME)
-
         wal_file = f'{dbfile}{WAL_EXTENSION}'
 
-        # Ask before overwriting dbfile and dbfile-wal (if force flag is not set)
-        # Note that this creates a TOCTOU race-condition
-        # Should be fine in basically all cases though
-        if not force:
-            if os.path.isfile(dbfile):
-                # Use stderr for input to avoid cluttering stdout
-                sys.stderr.write(f'File "{dbfile}" already exists, overwrite? [y/N]: ')
-                resp = input().upper()
-                if resp not in ['Y', 'YES']:
-                    exit(1)
-            if os.path.isfile(wal_file):
-                # Use stderr for input to avoid cluttering stdout
-                sys.stderr.write(f'File "{wal_file}" already exists, overwrite? [y/N]: ')
-                resp = input().upper()
-                if resp not in ['Y', 'YES']:
-                    exit(1)
-
         # Copy db to host
+        # No need to ask for confimation since dbfile is in tmpdir
         device.pull(DB_TEMP_FILE, dbfile)
         device.pull(f'{DB_TEMP_FILE}{WAL_EXTENSION}', wal_file)
 
@@ -695,7 +683,7 @@ def main():
                 bookmarks_out += '\n'
 
             # Output the exported bookmarks
-            if outfile == '':
+            if outfile == STDSTREAM_INDICATOR:
                 print(bookmarks_out, end='')
             else:
                 # Ask before overwriting (if force flag is not set)
@@ -733,7 +721,7 @@ def main():
                 exit(1)
 
         with sqlite3.connect(dbfile) as conn:
-            if infile == '':
+            if infile == STDSTREAM_INDICATOR:
                 file_contents = sys.stdin.read()
             else:
                 with open(infile, 'r') as ifile:
@@ -766,8 +754,33 @@ def main():
                          f'rm -f \'\\\'\'{DB_TEMP_FILE}\'\\\'\';'
         device.shell(f'su -c \'{mv_db_commands}\'')
 
+    # The copydb flag has been used
+    elif copy_db_target is not None:
+        wal_file = f'{dbfile}{WAL_EXTENSION}'
+        wal_target = f'{copy_db_target}{WAL_EXTENSION}'
+
+        # Ask before overwriting copy_db_target and copy_db_target-wal (if force flag is not set)
+        # Note that this creates a TOCTOU race-condition
+        # Should be fine in basically all cases though
+        if not force:
+            if os.path.isfile(copy_db_target):
+                # Use stderr for input to avoid cluttering stdout
+                sys.stderr.write(f'File "{copy_db_target}" already exists, overwrite? [y/N]: ')
+                resp = input().upper()
+                if resp not in ['Y', 'YES']:
+                    exit(1)
+            if os.path.isfile():
+                # Use stderr for input to avoid cluttering stdout
+                sys.stderr.write(f'File "{wal_target}" already exists, overwrite? [y/N]: ')
+                resp = input().upper()
+                if resp not in ['Y', 'YES']:
+                    exit(1)
+
+        shutil.copyfile(dbfile, copy_db_target)
+        shutil.copyfile(wal_file, wal_target)
+
     # This should not happen
-    elif not copydb:
+    else:
         raise RuntimeError('No export or import or copydb flag given.')
 
 

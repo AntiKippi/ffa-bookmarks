@@ -49,17 +49,18 @@ END_TAG_NAME = string.whitespace + '>'
 
 STDSTREAM_INDICATOR = ''
 
-BASE_QUERY = 'SELECT mb.guid, mb.title, mb.position, mb.dateAdded, mb.lastModified, mb.id, mb.type, mp.url FROM moz_bookmarks mb LEFT OUTER JOIN moz_places mp ON mb.fk = mp.id'
+BASE_QUERY = 'SELECT mb.guid, mb.title, mb.position, mb.dateAdded, mb.lastModified, mb.id, mb.type, mp.url '\
+             'FROM moz_bookmarks mb LEFT OUTER JOIN moz_places mp ON mb.fk = mp.id'
 NODE_QUERY = f'{BASE_QUERY} WHERE mb.guid = ?'
 CHILDREN_QUERY = f'{BASE_QUERY} WHERE mb.parent = ?'
 
 URL_EXISTS_QUERY = 'SELECT id FROM moz_places WHERE url = ?'
 LAST_INSERTED_QUERY = 'SELECT last_insert_rowid()'
 INSERT_PLACE_QUERY = 'INSERT INTO moz_places(url, guid, url_hash) VALUES (:url, :guid, 0)'
-INSERT_BOOKMARK_QUERY = 'INSERT INTO moz_bookmarks (id, fk, type, parent, position, title, dateAdded, lastModified, guid) ' + \
-                        'VALUES (:id, :fk, :typeCode, :parent, :index, :title, :dateAdded, :lastModified, :guid) ' + \
+INSERT_BOOKMARK_QUERY = 'INSERT INTO moz_bookmarks (id, fk, type, parent, position, title, dateAdded, lastModified, guid) '\
+                        'VALUES (:id, :fk, :typeCode, :parent, :index, :title, :dateAdded, :lastModified, :guid) '\
                         'ON CONFLICT DO UPDATE SET fk = :fk, type = :typeCode, parent = :parent, position = :index, title = :title, dateAdded = :dateAdded, lastModified = :lastModified, guid = :guid'
-INSERT_BOOKMARK_AUTOINCREMENT_QUERY = 'INSERT INTO moz_bookmarks (fk, type, parent, position, title, dateAdded, lastModified, guid) ' + \
+INSERT_BOOKMARK_AUTOINCREMENT_QUERY = 'INSERT INTO moz_bookmarks (fk, type, parent, position, title, dateAdded, lastModified, guid) '\
                                       'VALUES (:fk, :typeCode, :parent, :index, :title, :dateAdded, :lastModified, :guid)'
 
 TYPE_LOOKUP = {
@@ -83,6 +84,7 @@ ROOT_LOOKUP = {
     ROOT[3]: 'unfiledBookmarksFolder',
     ROOT[4]: 'mobileFolder'
 }
+
 
 def bookmarks_to_html(bookmarks):
     def add_node(node, spaces):
@@ -141,16 +143,16 @@ def generate_guid():
     return ''.join(random.choice(ALPHABET) for i in range(12))
 
 
-def generate_node(guid, title, index, dateAdded, lastModified, id, typeCode, uri=None, children=None):
+def generate_node(guid, title, index, date_added, last_modified, bookmark_id, type_code, uri=None, children=None):
     node = {
         'guid': guid,
         'title': title,
         'index': index,
-        'dateAdded': dateAdded,
-        'lastModified': lastModified,
-        'id': id,
-        'typeCode': typeCode,
-        'type': TYPE_LOOKUP[typeCode]
+        'dateAdded': date_added,
+        'lastModified': last_modified,
+        'id': bookmark_id,
+        'typeCode': type_code,
+        'type': TYPE_LOOKUP[type_code]
     }
 
     if node['guid'] in ROOT_LOOKUP:
@@ -201,13 +203,11 @@ def html_to_xmltree(html):
                 quote = None
             # Escape all <, > and & in strings
             elif html[i] == '>':
-                html[i] = '&'
-                html.insert(i + 1, 'gt;')
+                html[i] = '&gt;'
             elif html[i] == '<':
-                html[i] = '&'
-                html.insert(i + 1, 'lt;')
+                html[i] = '&lt;'
             elif html[i] == '&':
-                html.insert(i + 1, 'amp;')
+                html[i] = '&amp;'
         elif state == State.KillTag:
             if html[i] == '>':
                 state = new_state.pop()
@@ -220,11 +220,10 @@ def html_to_xmltree(html):
         # Skip all the junk at the beginning until the first <DL>
         elif state == State.Initial:
             if html[i] == '<':
-                if i < len(html) + 3 and html[i + 1].upper() == 'D' and html[i + 2].upper() == 'L' and html[
-                    i + 3] in END_TAG_NAME:
+                if i < len(html) + 3 and html[i + 1].upper() == 'D' and html[i + 2].upper() == 'L' and html[i + 3] in END_TAG_NAME:
                     # i should now be at the beginning of the outer <DL> block
                     start = i
-                    new_state.append(state.Found)
+                    new_state.append(State.Found)
                 else:
                     new_state.append(state)
                 state = State.InsideTag
@@ -373,7 +372,7 @@ def initialize_adb_device(adb_tcp, privkey, pubkey, adb_server, adb_serial, forc
         # Try loading the private key, try once again if it failed
         for i in range(0, 2):
             try:
-                with open(privkey) as f:
+                with open(privkey, 'r', encoding='utf-8') as f:
                     priv = f.read()
             except FileNotFoundError:
                 # If private key file doesn't exist, create it
@@ -407,7 +406,7 @@ def initialize_adb_device(adb_tcp, privkey, pubkey, adb_server, adb_serial, forc
         # Try reading the public key file, try once again if it fails
         for i in range(0, 2):
             try:
-                with open(pubkey) as f:
+                with open(pubkey, 'r', encoding='utf-8') as f:
                     pub = f.read()
             # Just generate a public key if it does not exist
             except FileNotFoundError:
@@ -482,10 +481,10 @@ def main():
                 _adb_device = initialize_adb_device(adb_tcp, privkey, pubkey, adb_server, adb_serial, force_server)
             except usb1.USBError as e:
                 sys.stderr.write(f'ERROR [ADB]: {e}.\nDevice might be blocked by your local adb server, try killing it.')
-                exit(1)
+                sys.exit(1)
             except Exception as e:
                 sys.stderr.write(f'ERROR [ADB]: {e}')
-                exit(1)
+                sys.exit(1)
 
         return _adb_device
 
@@ -521,7 +520,8 @@ def main():
                         required=False,
                         default=fileformat,
                         choices=VALID_FORMATS,
-                        help='Specify the file format. If omitted, the format is determined from the outfile extension or infile contents or JSON as fallback.')
+                        help='Specify the file format. If omitted, the format is determined '
+                             'from the outfile extension or infile contents or JSON as fallback.')
     parser.add_argument('-d',
                         '--db-file',
                         type=str,
@@ -597,7 +597,7 @@ def main():
                                const=STDSTREAM_INDICATOR,
                                dest='infile',
                                default=infile,
-                               help='Import the booksmarks from INFILE. If INFILE is omitted stdin is used.')
+                               help='Import the bookmarks from INFILE. If INFILE is omitted stdin is used.')
     command_group.add_argument('-e',
                                '--export',
                                type=str,
@@ -657,7 +657,7 @@ def main():
         wal_file = f'{dbfile}{WAL_EXTENSION}'
 
         # Copy db to host
-        # No need to ask for confimation since dbfile is in tmpdir
+        # No need to ask for confirmation since dbfile is in tmpdir
         device.pull(DB_TEMP_FILE, dbfile)
         device.pull(f'{DB_TEMP_FILE}{WAL_EXTENSION}', wal_file)
 
@@ -671,7 +671,6 @@ def main():
             with closing(conn.execute(NODE_QUERY, (ROOT[0],))) as res:
                 bookmarks = export_node(conn, res.fetchone())
 
-            bookmarks_out = ''
             if fileformat == Format.HTML:
                 bookmarks_out = bookmarks_to_html(bookmarks)
             else:
@@ -695,9 +694,9 @@ def main():
                     sys.stderr.write(f'File "{outfile}" already exists, overwrite? [y/N]: ')
                     resp = input().upper()
                     if resp not in ['Y', 'YES']:
-                        exit(1)
+                        sys.exit(1)
 
-                with open(outfile, 'w') as ofile:
+                with open(outfile, 'w', encoding='utf-8') as ofile:
                     ofile.write(bookmarks_out)
 
     # The import flag has been used
@@ -710,21 +709,21 @@ def main():
             # Use stderr for input to avoid cluttering stdout
             # Not really needed here since we are importing, but still stderr is used for consistency
             sys.stderr.write('Please review before importing:\n'
-                  f' - ADB Connection: {f"Server at {adb_server}" if server_connection else "Direct"}\n'
-                  f' - ADB Device: {dev_str}\n'
-                  f' - Firefox package name: {ff_package_name}\n'
-                  f' - Import file: "{infile if infile is not None else "stdin"}"\n'
-                  'Your existing bookmarks might be overridden. Continue? [y/N]: ')
+                             f' - ADB Connection: {f"Server at {adb_server}" if server_connection else "Direct"}\n'
+                             f' - ADB Device: {dev_str}\n'
+                             f' - Firefox package name: {ff_package_name}\n'
+                             f' - Import file: "{infile if infile is not None else "stdin"}"\n'
+                             'Your existing bookmarks might be overridden. Continue? [y/N]: ')
 
             resp = input().upper()
             if resp not in ['Y', 'YES']:
-                exit(1)
+                sys.exit(1)
 
         with sqlite3.connect(dbfile) as conn:
             if infile == STDSTREAM_INDICATOR:
                 file_contents = sys.stdin.read()
             else:
-                with open(infile, 'r') as ifile:
+                with open(infile, 'r', encoding='utf-8') as ifile:
                     file_contents = ifile.read()
 
             if fileformat is None:
@@ -768,13 +767,13 @@ def main():
                 sys.stderr.write(f'File "{copy_db_target}" already exists, overwrite? [y/N]: ')
                 resp = input().upper()
                 if resp not in ['Y', 'YES']:
-                    exit(1)
-            if os.path.isfile():
+                    sys.exit(1)
+            if os.path.isfile(wal_target):
                 # Use stderr for input to avoid cluttering stdout
                 sys.stderr.write(f'File "{wal_target}" already exists, overwrite? [y/N]: ')
                 resp = input().upper()
                 if resp not in ['Y', 'YES']:
-                    exit(1)
+                    sys.exit(1)
 
         shutil.copyfile(dbfile, copy_db_target)
         shutil.copyfile(wal_file, wal_target)
